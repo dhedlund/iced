@@ -860,6 +860,7 @@ mod tests {
 
         let request = ActionRequest {
             action: Action::Focus,
+            target_tree: TreeId::ROOT,
             target: NodeId(1),
             data: None,
         };
@@ -884,6 +885,7 @@ mod tests {
 
         handler.do_action(ActionRequest {
             action: Action::Click,
+            target_tree: TreeId::ROOT,
             target: ROOT_ID,
             data: None,
         });
@@ -1017,6 +1019,7 @@ mod tests {
                     for i in 0..n_actions {
                         handler.do_action(ActionRequest {
                             action: Action::Focus,
+                            target_tree: TreeId::ROOT,
                             target: NodeId(i as u64),
                             data: None,
                         });
@@ -1052,16 +1055,19 @@ mod tests {
 
         handler_a.do_action(ActionRequest {
             action: Action::Focus,
+            target_tree: TreeId::ROOT,
             target: ROOT_ID,
             data: None,
         });
         handler_b.do_action(ActionRequest {
             action: Action::Click,
+            target_tree: TreeId::ROOT,
             target: ROOT_ID,
             data: None,
         });
         handler_b.do_action(ActionRequest {
             action: Action::Focus,
+            target_tree: TreeId::ROOT,
             target: NodeId(1),
             data: None,
         });
@@ -1098,6 +1104,7 @@ mod tests {
         };
         handler.do_action(ActionRequest {
             action: Action::Focus,
+            target_tree: TreeId::ROOT,
             target: ROOT_ID,
             data: None,
         });
