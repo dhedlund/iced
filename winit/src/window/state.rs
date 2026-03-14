@@ -83,6 +83,11 @@ where
         }
     }
 
+    /// Returns the current window title.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
     pub fn viewport(&self) -> &Viewport {
         &self.viewport
     }
