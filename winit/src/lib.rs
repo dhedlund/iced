@@ -29,6 +29,10 @@ pub use winit;
 pub mod clipboard;
 pub mod conversion;
 
+#[cfg(feature = "a11y")]
+#[cfg_attr(docsrs, doc(cfg(feature = "a11y")))]
+pub mod a11y;
+
 mod error;
 mod proxy;
 mod window;
@@ -401,14 +405,26 @@ where
                                     };
                                 }
 
+                                let window = Arc::new(window);
+
+                                #[cfg(feature = "a11y")]
+                                let adapter = Some(a11y::A11yAdapter::new(
+                                    event_loop,
+                                    window.clone(),
+                                    id,
+                                    &title,
+                                ));
+
                                 self.process_event(
                                     event_loop,
                                     Event::WindowCreated {
                                         id,
-                                        window: Arc::new(window),
+                                        window,
                                         exit_on_close_request,
                                         make_visible: visible,
                                         on_open,
+                                        #[cfg(feature = "a11y")]
+                                        adapter,
                                     },
                                 );
                             }
@@ -462,7 +478,6 @@ where
     }
 }
 
-#[derive(Debug)]
 enum Event<Message: 'static> {
     WindowCreated {
         id: window::Id,
@@ -470,9 +485,26 @@ enum Event<Message: 'static> {
         exit_on_close_request: bool,
         make_visible: bool,
         on_open: oneshot::Sender<window::Id>,
+        #[cfg(feature = "a11y")]
+        adapter: Option<a11y::A11yAdapter>,
     },
     EventLoopAwakened(winit::event::Event<Message>),
     Exit,
+}
+
+impl<Message: std::fmt::Debug> std::fmt::Debug for Event<Message> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WindowCreated { id, .. } => f
+                .debug_struct("WindowCreated")
+                .field("id", id)
+                .finish_non_exhaustive(),
+            Self::EventLoopAwakened(event) => {
+                f.debug_tuple("EventLoopAwakened").field(event).finish()
+            }
+            Self::Exit => write!(f, "Exit"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -520,6 +552,10 @@ async fn run_instance<P>(
     let mut ui_caches = FxHashMap::default();
     let mut user_interfaces = ManuallyDrop::new(FxHashMap::default());
     let mut clipboard = Clipboard::unconnected();
+
+    let mut _pending_announcements: Vec<String> = Vec::new();
+    #[cfg(feature = "a11y")]
+    let mut a11y_tree_dirty = true;
 
     #[cfg(all(feature = "linux-theme-detection", target_os = "linux"))]
     let mut system_theme = {
@@ -575,6 +611,8 @@ async fn run_instance<P>(
                 exit_on_close_request,
                 make_visible,
                 on_open,
+                #[cfg(feature = "a11y")]
+                adapter,
             } => {
                 if compositor.is_none() {
                     let (compositor_sender, compositor_receiver) =
@@ -666,6 +704,12 @@ async fn run_instance<P>(
                     exit_on_close_request,
                     system_theme,
                 );
+
+                #[cfg(feature = "a11y")]
+                {
+                    window.adapter = adapter;
+                    a11y_tree_dirty = true;
+                }
 
                 window.raw.set_theme(conversion::window_theme(
                     window.state.theme_mode(),
@@ -759,6 +803,7 @@ async fn run_instance<P>(
                             &mut ui_caches,
                             &mut is_window_opening,
                             &mut system_theme,
+                            &mut _pending_announcements,
                         );
                         actions += 1;
                     }
@@ -895,7 +940,13 @@ async fn run_instance<P>(
                                         &mut ui_caches,
                                         &mut is_window_opening,
                                         &mut system_theme,
+                                        &mut _pending_announcements,
                                     );
+                                }
+
+                                #[cfg(feature = "a11y")]
+                                {
+                                    a11y_tree_dirty = true;
                                 }
 
                                 for (window_id, window) in
@@ -1061,9 +1112,19 @@ async fn run_instance<P>(
                             continue;
                         };
 
+                        #[cfg(feature = "a11y")]
+                        if let Some(adapter) = &mut window.adapter {
+                            adapter.process_event(&window_event);
+                        }
+
                         match window_event {
                             winit::event::WindowEvent::Resized(_) => {
                                 window.raw.request_redraw();
+
+                                #[cfg(feature = "a11y")]
+                                {
+                                    a11y_tree_dirty = true;
+                                }
                             }
                             winit::event::WindowEvent::ThemeChanged(theme) => {
                                 let mode = conversion::theme_mode(theme);
@@ -1102,6 +1163,7 @@ async fn run_instance<P>(
                                 &mut ui_caches,
                                 &mut is_window_opening,
                                 &mut system_theme,
+                                &mut _pending_announcements,
                             );
                         } else {
                             window.state.update(
@@ -1123,6 +1185,130 @@ async fn run_instance<P>(
                         if actions > 0 {
                             proxy.free_slots(actions);
                             actions = 0;
+                        }
+
+                        // N.B. Accessibility actions must be drained BEFORE
+                        // the early-continue guard below. Synthetic events
+                        // from AT actions need to be in the queue when the
+                        // guard checks `events.is_empty()`, otherwise they
+                        // are silently dropped when no other events are
+                        // pending.
+                        #[cfg(feature = "a11y")]
+                        let mut a11y_focus_ops: Vec<(
+                            window::Id,
+                            crate::core::widget::Id,
+                        )> = Vec::new();
+
+                        #[cfg(feature = "a11y")]
+                        for (id, window) in window_manager.iter_mut() {
+                            let at_actions = if let Some(ref adapter) =
+                                window.adapter
+                                && adapter.is_active()
+                            {
+                                adapter.drain_action_requests()
+                            } else {
+                                continue;
+                            };
+
+                            for a11y_action in at_actions {
+                                let target = a11y_action.request.target;
+                                let action = a11y_action.request.action;
+
+                                let target_entry =
+                                    window.a11y_node_map.get(&target);
+
+                                let bounds = target_entry.map(|(_wid, b)| *b);
+
+                                match action {
+                                    accesskit::Action::Focus => {
+                                        if let Some((widget_id, b)) =
+                                            target_entry
+                                        {
+                                            if let Some(wid) = widget_id {
+                                                a11y_focus_ops
+                                                    .push((id, wid.clone()));
+                                            } else {
+                                                let center = b.center();
+                                                window
+                                                    .state
+                                                    .set_cursor_position(
+                                                        center,
+                                                    );
+                                                events.push((
+                                                    id,
+                                                    a11y::synthetic_cursor_move(
+                                                        center,
+                                                    ),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    accesskit::Action::Click => {
+                                        if let Some(bounds) = bounds {
+                                            let center = bounds.center();
+                                            window
+                                                .state
+                                                .set_cursor_position(center);
+                                            for event in
+                                                a11y::synthetic_click(center)
+                                            {
+                                                events.push((id, event));
+                                            }
+                                        }
+                                    }
+                                    accesskit::Action::Increment => {
+                                        if let Some(bounds) = bounds {
+                                            let center = bounds.center();
+                                            window
+                                                .state
+                                                .set_cursor_position(center);
+                                            for event in
+                                                a11y::synthetic_arrow_key(
+                                                    center,
+                                                    crate::core::keyboard::key::Named::ArrowUp,
+                                                )
+                                            {
+                                                events.push((id, event));
+                                            }
+                                        }
+                                    }
+                                    accesskit::Action::Decrement => {
+                                        if let Some(bounds) = bounds {
+                                            let center = bounds.center();
+                                            window
+                                                .state
+                                                .set_cursor_position(center);
+                                            for event in
+                                                a11y::synthetic_arrow_key(
+                                                    center,
+                                                    crate::core::keyboard::key::Named::ArrowDown,
+                                                )
+                                            {
+                                                events.push((id, event));
+                                            }
+                                        }
+                                    }
+                                    other => {
+                                        log::debug!(
+                                            "a11y: unhandled action {:?}",
+                                            other
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        #[cfg(feature = "a11y")]
+                        for (win_id, widget_id) in a11y_focus_ops.drain(..) {
+                            if let Some(ui) = user_interfaces.get_mut(&win_id)
+                                && let Some(window) =
+                                    window_manager.get_mut(win_id)
+                            {
+                                let mut focus_op =
+                                    operation::focusable::focus(widget_id);
+                                ui.operate(&window.renderer, &mut focus_op);
+                                a11y_tree_dirty = true;
+                            }
                         }
 
                         if events.is_empty()
@@ -1246,12 +1432,47 @@ async fn run_instance<P>(
                                     &mut ui_caches,
                                     &mut is_window_opening,
                                     &mut system_theme,
+                                    &mut _pending_announcements,
                                 );
                             }
 
                             for (_id, window) in window_manager.iter_mut() {
                                 window.raw.request_redraw();
                             }
+
+                            #[cfg(feature = "a11y")]
+                            {
+                                a11y_tree_dirty = true;
+                            }
+                        }
+
+                        #[cfg(feature = "a11y")]
+                        if a11y_tree_dirty {
+                            let mut a11y_had_active = false;
+                            for (id, ui) in user_interfaces.iter_mut() {
+                                if let Some(window) =
+                                    window_manager.get_mut(*id)
+                                    && let Some(ref mut adapter) =
+                                        window.adapter
+                                    && adapter.is_active()
+                                {
+                                    a11y_had_active = true;
+                                    let mut builder = a11y::TreeBuilder::new(
+                                        window.state.title(),
+                                    )
+                                    .with_announcements(
+                                        &_pending_announcements,
+                                    );
+                                    ui.operate(&window.renderer, &mut builder);
+                                    let tree = builder.build();
+                                    window.a11y_node_map = tree.node_map;
+                                    adapter.update_if_active(|| tree.update);
+                                }
+                            }
+                            if a11y_had_active {
+                                _pending_announcements.clear();
+                            }
+                            a11y_tree_dirty = false;
                         }
 
                         if let Some(redraw_at) = window_manager.redraw_at() {
@@ -1359,6 +1580,7 @@ fn run_action<'a, P, C>(
     ui_caches: &mut FxHashMap<window::Id, user_interface::Cache>,
     is_window_opening: &mut bool,
     system_theme: &mut theme::Mode,
+    pending_announcements: &mut Vec<String>,
 ) where
     P: Program,
     C: Compositor<Renderer = P::Renderer> + 'static,
@@ -1803,6 +2025,9 @@ fn run_action<'a, P, C>(
 
                 window.raw.request_redraw();
             }
+        }
+        Action::Announce(text) => {
+            pending_announcements.push(text);
         }
         Action::Exit => {
             control_sender
